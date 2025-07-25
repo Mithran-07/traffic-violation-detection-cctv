@@ -1,0 +1,114 @@
+import cv2
+import numpy as np
+from ultralytics import YOLO
+
+# Load YOLOv8 model
+model = YOLO("yolov8n.pt")
+
+# Open your video
+cap = cv2.VideoCapture(r"C:\Users\Hari ragav K.S\New_folder\optiway ai\video assets\rlv_l.mp4")
+if not cap.isOpened():
+    print("❌ Error: Could not open video.")
+    exit()
+else:
+    print("✅ Video opened successfully.")
+
+STOP_LINE_Y = 270  # Adjust as needed
+
+# HSV ranges for detecting red
+lower_red1 = np.array([0, 100, 100])
+upper_red1 = np.array([10, 255, 255])
+lower_red2 = np.array([160, 100, 100])
+upper_red2 = np.array([179, 255, 255])
+
+object_positions = {}
+violation_ids = set()
+violation_count = 0
+traffic_light_box = None  # to store detected signal box
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    results = model.track(frame, persist=True, classes=[2, 3, 5, 7, 9])  # vehicle + traffic light
+
+    # --- Detect traffic light dynamically
+    traffic_light_box = None
+    red_on = False
+    if results[0].boxes.cls is not None:
+        classes = results[0].boxes.cls.cpu().numpy().astype(int)
+        boxes = results[0].boxes.xyxy.cpu().numpy()
+
+        for box, cls_id in zip(boxes, classes):
+            x1, y1, x2, y2 = map(int, box)
+            if cls_id == 9:  # traffic light
+                traffic_light_box = (x1, y1, x2, y2)
+                break
+
+    # --- Detect red signal
+    if traffic_light_box:
+        x1, y1, x2, y2 = traffic_light_box
+        signal_crop = frame[y1:y2, x1:x2]
+        if signal_crop.size > 0:
+            hsv = cv2.cvtColor(signal_crop, cv2.COLOR_BGR2HSV)
+            mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
+            mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
+            red_mask = cv2.bitwise_or(mask1, mask2)
+            red_on = cv2.countNonZero(red_mask) > 50
+
+            # Draw signal box
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(frame, "RED" if red_on else "GREEN", (x1, y1 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                        (0, 0, 255) if red_on else (0, 255, 0), 2)
+
+    # Draw stop line
+    cv2.line(frame, (0, STOP_LINE_Y), (frame.shape[1], STOP_LINE_Y), (0, 0, 255), 2)
+
+    # --- Track Vehicles & Detect Violations
+    if results[0].boxes.id is not None:
+        boxes = results[0].boxes.xyxy.cpu().numpy()
+        ids = results[0].boxes.id.cpu().numpy().astype(int)
+        classes = results[0].boxes.cls.cpu().numpy().astype(int)
+
+        for box, obj_id, cls_id in zip(boxes, ids, classes):
+            if cls_id not in [2, 3, 5, 7]:  # car, bike, bus, truck
+                continue
+
+            x1, y1, x2, y2 = map(int, box)
+            cx = (x1 + x2) // 2
+            cy = (y1 + y2) // 2
+
+            # Store previous Y position for motion check
+            moved = False
+            if obj_id in object_positions:
+                prev_cy = object_positions[obj_id]
+                moved = abs(cy - prev_cy) > 2  # Vehicle is moving
+            object_positions[obj_id] = cy
+
+            label = f"ID:{obj_id}"
+
+            if red_on and cy < STOP_LINE_Y and moved:
+                if obj_id not in violation_ids:
+                    violation_ids.add(obj_id)
+                    violation_count += 1
+                    print(f"🚨 Violation #{violation_count} by ID {obj_id}")
+                label = "Violation Car"
+
+            # Draw bounding box and label
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 255, 0), 2)
+            cv2.putText(frame, label, (x1, y1 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                        (0, 0, 255) if "Violation" in label else (255, 255, 255), 2)
+
+    # --- Display violation count
+    cv2.putText(frame, f"Violations: {violation_count}", (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
+
+    cv2.imshow("Traffic Violation Detection", frame)
+    if cv2.waitKey(1) & 0xFF == ord("q"):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
