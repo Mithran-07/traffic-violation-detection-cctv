@@ -1,0 +1,174 @@
+import os
+from flask import Flask, render_template, request, redirect, flash, send_from_directory
+from werkzeug.utils import secure_filename
+import cv2
+from ultralytics import YOLO
+import numpy as np
+
+UPLOAD_FOLDER = 'uploads'
+PROCESSED_FOLDER = 'processed'
+ALLOWED_EXTENSIONS = {'mp4', 'avi', 'mov'}
+
+PIXELS_PER_METER = 8  # Adjust based on your camera calibration
+
+app = Flask(__name__)
+app.secret_key = 'your_secret_key'
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+app.config['PROCESSED_FOLDER'] = PROCESSED_FOLDER
+
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(PROCESSED_FOLDER, exist_ok=True)
+
+# Load YOLOv5 vehicle detection
+try:
+    model_vehicle = YOLO('yolov5s.pt')
+    print("✅ YOLOv5 vehicle model loaded.")
+except Exception as e:
+    raise FileNotFoundError(f'YOLOv5 vehicle model not found: {e}')
+
+# Load YOLOv8 helmet/person detection
+try:
+    model_helmet = YOLO('yolov8_helmet.pt')
+    print("✅ YOLOv8 helmet/person model loaded.")
+except Exception as e:
+    model_helmet = None
+    print(f'⚠️ YOLOv8 helmet model not loaded: {e}')
+
+VEHICLE_CLASSES = ['car', 'motorcycle', 'bus', 'truck', 'bicycle']
+
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def process_video(input_path, output_path):
+    cap = cv2.VideoCapture(input_path)
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+
+    vehicle_tracks = {}
+    next_id = 0
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        results = model_vehicle(frame)
+        boxes = results[0].boxes
+        current_centroids = []
+
+        for box in boxes:
+            x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+            cls_id = int(box.cls[0])
+            label = model_vehicle.names[cls_id]
+            conf = float(box.conf[0])
+
+            if label in VEHICLE_CLASSES:
+                cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+                current_centroids.append((cx, cy, x1, y1, x2, y2, label))
+
+        updated_tracks = {}
+        for cx, cy, x1, y1, x2, y2, label in current_centroids:
+            min_dist = float('inf')
+            matched_id = None
+            for track_id, track_data in vehicle_tracks.items():
+                prev_cx, prev_cy = track_data['centroid']
+                dist = np.hypot(cx - prev_cx, cy - prev_cy)
+                if dist < 50 and dist < min_dist:
+                    min_dist = dist
+                    matched_id = track_id
+
+            if matched_id is None:
+                matched_id = next_id
+                next_id += 1
+
+            # Calculate speed if possible
+            speed_kmh = 0
+            if matched_id in vehicle_tracks:
+                prev_cx, prev_cy = vehicle_tracks[matched_id]['centroid']
+                displacement_px = np.hypot(cx - prev_cx, cy - prev_cy)
+                displacement_m = displacement_px / PIXELS_PER_METER
+                time_s = 1 / fps if fps else 0.033
+                speed_m_s = displacement_m / time_s
+                speed_kmh = speed_m_s * 3.6
+
+            updated_tracks[matched_id] = {'centroid': (cx, cy), 'label': label}
+
+            # Draw vehicle box with speed
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            overlay_text = f"{label} {conf:.2f} | {speed_kmh:.1f} km/h"
+            cv2.putText(frame, overlay_text, (x1, y1 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+            # Helmet + triple riding detection
+            if label == 'motorcycle' and model_helmet is not None:
+                crop = frame[y1:y2, x1:x2]
+                helmet_results = model_helmet(crop)
+                helmet_boxes = helmet_results[0].boxes
+
+                helmet_detected = False
+                person_count = 0
+
+                for h_box in helmet_boxes:
+                    h_cls_id = int(h_box.cls[0])
+                    h_label = model_helmet.names[h_cls_id].strip().lower()
+
+                    if 'helmet' in h_label:
+                        helmet_detected = True
+                        hx1, hy1, hx2, hy2 = map(int, h_box.xyxy[0].tolist())
+                        cv2.rectangle(crop, (hx1, hy1), (hx2, hy2), (255, 0, 0), 2)
+                        cv2.putText(crop, "HELMET", (hx1, hy1 - 5),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+
+                    if 'person' in h_label:
+                        person_count += 1
+
+                if not helmet_detected:
+                    cv2.putText(frame, "NO HELMET", (x1, y2 + 20),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+                if person_count > 2:
+                    cv2.putText(frame, "TRIPLE RIDING", (x1, y2 + 40),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+        vehicle_tracks = updated_tracks
+        out.write(frame)
+
+    cap.release()
+    out.release()
+
+@app.route('/', methods=['GET', 'POST'])
+def index():
+    if request.method == 'POST':
+        if 'file' not in request.files:
+            flash('No file part.')
+            return redirect(request.url)
+        file = request.files['file']
+        if file.filename == '':
+            flash('No selected file.')
+            return redirect(request.url)
+        if file and allowed_file(file.filename):
+            filename = secure_filename(file.filename)
+            input_path = os.path.join(UPLOAD_FOLDER, filename)
+            output_filename = 'processed_' + filename
+            output_path = os.path.join(PROCESSED_FOLDER, output_filename)
+
+            file.save(input_path)
+            flash('File uploaded, processing...')
+            process_video(input_path, output_path)
+            flash('Processing complete, see below.')
+
+            return render_template('index.html', processed_video=output_filename)
+        else:
+            flash('Invalid file type, please upload a video file.')
+            return redirect(request.url)
+    return render_template('index.html', processed_video=None)
+
+@app.route('/processed/<filename>')
+def processed_video(filename):
+    return send_from_directory(PROCESSED_FOLDER, filename)
+
+if __name__ == '__main__':
+    app.run(debug=True)
